@@ -1,0 +1,414 @@
+# services/connection_service.py
+import threading
+import time
+import socket
+from modbus_client.tcp_client import ModbusTCPClient
+from modbus_client.rtu_over_tcp_client import ModbusRtuOverTcpClient
+from modbus_client.exceptions import ConnectionException, ModbusException
+
+class ConnectionService:
+    def __init__(self, log_service, register_service):
+        self.log_service = log_service
+        self.register_service = register_service
+        self.client = None # IMPORTANTE: Se instancia en connect, se limpia en disconnect/error
+        self._keep_alive_thread = None
+        self._stop_keep_alive_event = threading.Event()
+        self.keep_alive_interval = 15
+
+        self._state = { # Estado inicial bien definido
+            "connected": False, "is_connecting": False, "message": "Desconectado",
+            "ip": None, "port": None, "unit_id": None, "mode": None,
+            "uptime_seconds": 0, "last_error": None, "last_keep_alive_ok": None,
+        }
+        self._state_lock = threading.Lock()
+        self._connection_thread = None
+        self._cancel_connection_event = threading.Event()
+
+        self.max_retries = 6
+        self.retry_delay = 1.0
+
+    def get_client(self):
+        with self._state_lock:
+            return self.client if self._state["connected"] else None
+
+    def get_connection_status(self):
+        with self._state_lock:
+            if self._state["connected"] and self.client:
+                 try: self._state["uptime_seconds"] = self.client.get_connection_uptime()
+                 except Exception: self._state["uptime_seconds"] = 0
+            elif not self._state["connected"]: self._state["uptime_seconds"] = 0
+            return self._state.copy()
+
+    def _update_status(self, **kwargs):
+        """Actualiza el estado de forma segura usando kwargs."""
+        with self._state_lock:
+            # Actualizar solo las claves proporcionadas
+            for key, value in kwargs.items():
+                if key in self._state:
+                    if key == "last_error" and value == "CLEAR":
+                        self._state["last_error"] = None
+                    else:
+                        self._state[key] = value
+                else:
+                    self.log_service.log_warning(f"_update_status: Clave desconocida '{key}'")
+
+            # Lógica de reseteo dependiente
+            if kwargs.get("connected") is False:
+                self._state["uptime_seconds"] = 0
+                self._state["last_keep_alive_ok"] = None
+                # No limpiar error aquí si se está estableciendo uno nuevo
+            if kwargs.get("connected") is True:
+                 if "last_error" not in kwargs: # Limpiar error si conectamos y no se pasa un error
+                    self._state["last_error"] = None
+
+    def _reset_state_to_disconnected(self, message="Desconectado", error=None):
+          # ... (igual que antes, asegura limpieza de self.client) ...
+          client_temp = self.client # Guardar referencia temporal
+          self.client = None # Limpiar referencia principal PRIMERO
+          self._update_status(
+              connected=False, is_connecting=False, message=message,
+              ip=None, port=None, unit_id=None, mode=None,
+              uptime_seconds=0, last_error=error, last_keep_alive_ok=None
+          )
+          if client_temp: # Intentar desconectar la instancia anterior
+               try: client_temp.disconnect()
+               except Exception: pass
+          self.log_service.log_debug("Estado reseteado a desconectado.")
+
+
+    def _check_port_open(self, ip, port, timeout=1.0):
+        """Verifica rápidamente si un puerto TCP está abierto."""
+        sock = None
+        try:
+            self.log_service.log_debug(f"Realizando pre-check de conexión a {ip}:{port} (Timeout: {timeout}s)...")
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            sock.connect((ip, port))
+            self.log_service.log_debug(f"Pre-check exitoso: Puerto {port} está abierto en {ip}.")
+            return True
+        except socket.timeout:
+            self.log_service.log_warning(f"Pre-check fallido: Timeout conectando a {ip}:{port}.")
+            return False
+        except socket.error as e:
+            self.log_service.log_warning(f"Pre-check fallido: Error de socket conectando a {ip}:{port} - {e}")
+            return False
+        except Exception as e:
+            self.log_service.log_error(f"Pre-check fallido: Error inesperado conectando a {ip}:{port} - {e}")
+            return False
+        finally:
+            if sock:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
+    def connect(self, ip, port, unit_id, mode='tcp'):
+        # ... (igual que antes: log request, check state, pre-check, instantiate client, update status, start thread) ...
+        self.log_service.log_info(f"API Connect Request: IP={ip}, Port={port}, UnitID={unit_id}, Mode={mode}")
+        with self._state_lock:
+            if self._state["is_connecting"] or self._state["connected"]:
+                msg = "Conexión ya activa." if self._state["connected"] else "Conexión ya en progreso."
+                self.log_service.log_warning(f"Intento de conexión ignorado: {msg}")
+                return {"success": False, "message": msg}
+
+            if not self._check_port_open(ip, int(port)):
+                 error_msg = f"Pre-check fallido: No se encontró servidor o el puerto está cerrado en {ip}:{port}."
+                 self.log_service.log_error(error_msg)
+                 self._update_status(is_connecting=False, connected=False, message="Fallo de conexión", ip=ip, port=int(port), unit_id=int(unit_id), mode=mode, last_error=error_msg)
+                 return {"success": False, "message": error_msg}
+
+            self.log_service.log_info(f"Instanciando cliente para modo: {mode.upper()}")
+            self.client = None
+            try:
+                 if mode == 'tcp': self.client = ModbusTCPClient()
+                 elif mode == 'rtu_over_tcp': self.client = ModbusRtuOverTcpClient()
+                 else: raise ValueError(f"Modo desconocido: {mode}")
+                 self.client.set_log_service(self.log_service) # <-- Asegurar que esto se haga
+                 self.log_service.log_debug(f"Cliente {type(self.client).__name__} instanciado OK.")
+            except Exception as e:
+                 self.log_service.log_critical(f"Error al instanciar cliente Modbus {mode}: {e}")
+                 self._reset_state_to_disconnected(message="Error interno", error=f"Fallo al crear cliente {mode}")
+                 return {"success": False, "message": f"Error interno al seleccionar modo {mode}."}
+
+            # Verificar si el cliente se instanció y tiene logger
+            if not self.client or not getattr(self.client, '_log_service', None):
+                 self.log_service.log_critical("FALLO CRÍTICO: Cliente no instanciado o logger no seteado antes de iniciar hilo.")
+                 self._reset_state_to_disconnected(message="Error interno", error="Fallo inicialización cliente")
+                 return {"success": False, "message": "Error interno del servidor."}
+
+
+            self.log_service.log_info(f"Iniciando hilo worker para conexión ({mode.upper()})...")
+            self._cancel_connection_event.clear()
+            self._update_status(is_connecting=True, connected=False, message="Conectando...", ip=ip, port=int(port), unit_id=int(unit_id), mode=mode, last_error="CLEAR", uptime=0)
+
+            self._connection_thread = threading.Thread(target=self._connection_worker_simplified, args=(ip, int(port), int(unit_id)), name="ConnectionWorker") # <- Usar worker simplificado
+            self._connection_thread.daemon = True
+            self._connection_thread.start()
+            self.log_service.log_debug("Hilo worker simplificado iniciado.")
+
+            return {"success": True, "message": f"Proceso de conexión ({mode.upper()}) iniciado..."}
+
+    def _connection_worker_simplified(self, ip, port, unit_id):
+        """Versión ultra simplificada del worker para diagnosticar inicio."""
+        worker_success = False
+        worker_error = None
+        print("WORKER_SIMPLE: Hilo iniciado.")
+        try:
+            self.log_service.log_info("WORKER_SIMPLE: Hilo iniciado correctamente.")
+
+            # Verificar acceso a dependencias
+            self.log_service.log_debug("WORKER_SIMPLE: Verificando self.log_service...")
+            if not self.log_service:
+                 print("WORKER_SIMPLE: ERROR - self.log_service es None.")
+                 raise ValueError("LogService no disponible en worker.")
+            self.log_service.log_debug("WORKER_SIMPLE: self.log_service OK.")
+
+            self.log_service.log_debug("WORKER_SIMPLE: Verificando self.client...")
+            if not self.client:
+                 print("WORKER_SIMPLE: ERROR - self.client es None.")
+                 raise ValueError("Client no disponible en worker.")
+            self.log_service.log_debug(f"WORKER_SIMPLE: self.client OK ({type(self.client).__name__}).")
+
+            # Simular un trabajo corto
+            self.log_service.log_info("WORKER_SIMPLE: Simulando trabajo...")
+            print("WORKER_SIMPLE: Simulando trabajo...")
+            time.sleep(2) # Simular que intenta conectar por 2 segundos
+
+             # ---- EN EL FUTURO: PONER AQUÍ EL BUCLE DE REINTENTOS ----
+             # Por ahora, simplemente marcamos como éxito simulado
+            self.log_service.log_info("WORKER_SIMPLE: Trabajo simulado completado (simulando éxito).")
+            print("WORKER_SIMPLE: Trabajo simulado completado (simulando éxito).")
+            worker_success = True
+            # ---------------------------------------------------------
+
+        except Exception as e:
+            print(f"WORKER_SIMPLE: EXCEPCIÓN CAPTURADA: {type(e).__name__}: {e}")
+            self.log_service.log_critical(f"WORKER_SIMPLE: EXCEPCIÓN CAPTURADA: {type(e).__name__}: {e}")
+            worker_error = e # Guardar el error
+            worker_success = False
+
+        finally:
+            # --- LIMPIEZA FINAL (simplificada también) ---
+            print(f"WORKER_SIMPLE: Terminando. Éxito={worker_success}. Error={worker_error}")
+            self.log_service.log_info(f"WORKER_SIMPLE: Terminando. Éxito={worker_success}. Error={worker_error}")
+            if worker_success:
+                 # SIMULAR ESTADO CONECTADO (temporal para prueba)
+                 self._update_status(connected=True, is_connecting=False, message="Conectado (Simulado)", last_error="CLEAR")
+                 # En un caso real, aquí iniciaríamos keep-alive y polling
+                 self.log_service.log_info("WORKER_SIMPLE: Estado actualizado a Conectado (Simulado).")
+            else:
+                 # Resetear estado en caso de fallo
+                 error_msg = f"Fallo en worker simplificado: {worker_error}" if worker_error else "Fallo desconocido en worker simplificado"
+                 self._reset_state_to_disconnected(message="Fallo conexión (Simulado)", error=error_msg)
+                 self.log_service.log_info("WORKER_SIMPLE: Estado reseteado a Desconectado debido a error.")
+
+            # Limpiar referencia al hilo
+            self._connection_thread = None
+            self.log_service.log_debug("WORKER_SIMPLE: Hilo finalizado y referencia limpiada.")
+            print("WORKER_SIMPLE: Hilo finalizado y referencia limpiada.")
+
+    def _connection_worker(self, ip, port, unit_id):
+        # Añadir un print temporal al inicio del worker
+        print("WORKER: Hilo iniciado.")
+        self.log_service.log_debug("WORKER: Hilo iniciado.")
+
+        connection_successful = False
+        final_message = ""
+        connect_exception = None
+
+        try:
+            for attempt in range(self.max_retries):
+                self.log_service.log_debug(f"WORKER: Inicio intento {attempt + 1}/{self.max_retries}.")
+                print(f"WORKER: Inicio intento {attempt + 1}/{self.max_retries}.")  # Print temporal
+
+                if self._cancel_connection_event.is_set():
+                    self.log_service.log_info("WORKER: Cancelación detectada al inicio del intento.")
+                    final_message = "Conexión cancelada."
+                    connect_exception = ConnectionException("Cancelled by user")
+                    break
+
+                attempt_msg = f"Intentando conectar (intento {attempt + 1}/{self.max_retries})..."
+                self.log_service.log_info(attempt_msg)  # LOG QUE FALTA VERSE
+                self._update_status(message=attempt_msg)
+
+                try:
+                    # LOGS CRÍTICOS ANTES/DESPUÉS DE LA LLAMADA BLOQUEANTE
+                    self.log_service.log_debug("WORKER: Verificando instancia de cliente...")
+                    print("WORKER: Verificando instancia de cliente...")  # Print temporal
+                    if not self.client:
+                        self.log_service.log_error("WORKER: Error - self.client es None antes de conectar.")
+                        raise ConnectionException("Instancia de cliente perdida en worker.")
+
+                    self.log_service.log_debug(f"WORKER: Llamando a self.client.connect({ip}, {port})...")
+                    print(f"WORKER: Llamando a self.client.connect({ip}, {port})...")  # Print temporal
+
+                    # --- Llamada Potencialmente Bloqueante ---
+                    self.client.connect(ip, port)
+                    # -----------------------------------------
+
+                    # Si llegamos aquí, connect() tuvo éxito (no lanzó excepción)
+                    self.log_service.log_info("WORKER: self.client.connect() completado exitosamente.")
+                    print("WORKER: self.client.connect() completado exitosamente.")  # Print temporal
+
+                    connection_successful = True
+                    final_message = "Conectado exitosamente."
+                    self.log_service.log_info(f"WORKER: {final_message}")
+                    self._update_status(connected=True, is_connecting=False, message="Conectado", last_error="CLEAR")
+                    self._start_keep_alive()
+                    break  # Salir del bucle for
+
+                except (ConnectionException, ModbusException, socket.error, Exception) as e:
+                    connect_exception = e
+                    self.log_service.log_error(
+                        f"WORKER: Intento {attempt + 1} fallido dentro del try: {type(e).__name__}: {e}")
+                    print(
+                        f"WORKER: Intento {attempt + 1} fallido dentro del try: {type(e).__name__}: {e}")  # Print temporal
+
+                    if attempt < self.max_retries - 1:
+                        self._update_status(message=f"Intento {attempt + 1} fallido. Reintentando...")
+                        self.log_service.log_debug(f"WORKER: Esperando {self.retry_delay}s para reintentar...")
+                        cancelled = self._cancel_connection_event.wait(timeout=self.retry_delay)
+                        if cancelled:
+                            self.log_service.log_info("WORKER: Cancelado durante espera de reintento.")
+                            final_message = "Conexión cancelada."
+                            connect_exception = ConnectionException("Cancelled during retry")
+                            break
+                    else:
+                        final_message = f"Fallo la conexión tras {self.max_retries} intentos: {e}"
+                        self.log_service.log_error(f"WORKER: {final_message}")
+                        # No break, el bucle termina naturalmente
+
+            # --- FIN DEL BUCLE FOR ---
+            self.log_service.log_debug("WORKER: Fin del bucle de reintentos.")
+
+        except Exception as worker_err:
+            self.log_service.log_critical(f"WORKER: Error CRÍTICO INESPERADO fuera del bucle: {worker_err}")
+            print(f"WORKER: Error CRÍTICO INESPERADO fuera del bucle: {worker_err}")  # Print temporal
+            final_message = f"Error interno del worker: {worker_err}"
+            connect_exception = worker_err
+            connection_successful = False
+
+        finally:
+            # --- LIMPIEZA FINAL ---
+            self.log_service.log_info(
+                f"WORKER: Terminando. Éxito={connection_successful}. Msg='{final_message}'. Err={connect_exception}")
+            print(
+                f"WORKER: Terminando. Éxito={connection_successful}. Msg='{final_message}'. Err={connect_exception}")  # Print temporal
+            if not connection_successful:
+                error_to_report = str(connect_exception) if connect_exception else "Fallo desconocido"
+                message_to_report = final_message if final_message else error_to_report
+                # Llamar a reset AHORA, para que /api/status devuelva el estado correcto
+                self._reset_state_to_disconnected(message=message_to_report, error=error_to_report)
+            # Limpiar referencia al hilo al final
+            self._connection_thread = None
+            self.log_service.log_debug("WORKER: Hilo finalizado y referencia limpiada.")
+            print("WORKER: Hilo finalizado y referencia limpiada.")  # Print temporal
+
+    def disconnect(self, initiated_by_polling=False):
+        # ... (código de disconnect sin cambios) ...
+        thread_to_join = None
+        was_connecting = False
+        was_connected = False
+        client_to_disconnect = None  # Guardar referencia al cliente actual
+        with self._state_lock:
+            was_connecting = self._state["is_connecting"]
+            was_connected = self._state["connected"]
+            current_mode = self._state["mode"]  # Guardar modo para logs
+            if not was_connected and not was_connecting:
+                if not initiated_by_polling: self.log_service.log_warning(
+                    "Intento de desconectar sin conexión activa o en progreso.")
+                return {"success": False, "message": "No estaba conectado."}
+            self.log_service.log_info(f"Iniciando desconexión (Modo: {current_mode})...")
+            self._stop_keep_alive()  # DETENER KEEP-ALIVE PRIMERO
+            if was_connecting and self._connection_thread and self._connection_thread.is_alive():
+                self.log_service.log_info("Señalizando cancelación al hilo de conexión...")
+                self._cancel_connection_event.set()
+                thread_to_join = self._connection_thread
+            client_to_disconnect = self.client  # Guardar referencia ANTES de limpiar
+            self.client = None  # Limpiar referencia principal
+            self._update_status(is_connecting=False, connected=False, message="Desconectando...")  # Estado intermedio
+            self.register_service.clear_register_data()
+        if thread_to_join:
+            self.log_service.log_info("Esperando que el hilo de conexión termine tras cancelación...")
+            thread_to_join.join(timeout=self.retry_delay + 1)
+            if thread_to_join.is_alive(): self.log_service.log_warning("El hilo de conexión no terminó a tiempo.")
+            self._connection_thread = None
+        # Desconectar cliente si existe
+        if client_to_disconnect:
+            try:
+                client_to_disconnect.disconnect()
+            except Exception as e:
+                self.log_service.log_error(f"Error durante la desconexión del cliente Modbus: {e}")
+        # Resetear estado FINALMENTE
+        self._reset_state_to_disconnected(message="Desconectado exitosamente.")
+        self.log_service.log_info("Proceso de desconexión completado.")
+        final_status = self.get_connection_status()
+        return {"success": not final_status["connected"], "message": final_status["message"]}
+
+
+    # --- Keep-Alive (sin cambios funcionales, pero ahora usa _reset_state_to_disconnected en fallo) ---
+    def _start_keep_alive(self):
+        # ... (igual que antes) ...
+        self._stop_keep_alive()
+        self._stop_keep_alive_event.clear()
+        self._keep_alive_thread = threading.Thread(target=self._keep_alive_worker, name="KeepAliveWorker")
+        self._keep_alive_thread.daemon = True
+        self._keep_alive_thread.start()
+        self.log_service.log_info(f"Keep-alive iniciado (intervalo {self.keep_alive_interval}s).")
+
+    def _stop_keep_alive(self):
+        # ... (igual que antes) ...
+        if self._keep_alive_thread and self._keep_alive_thread.is_alive():
+            self.log_service.log_info("Deteniendo keep-alive...")
+            self._stop_keep_alive_event.set()
+            self._keep_alive_thread = None
+        else:
+             self._stop_keep_alive_event.set()
+
+    def _keep_alive_worker(self):
+        while not self._stop_keep_alive_event.is_set():
+            cancelled = self._stop_keep_alive_event.wait(timeout=self.keep_alive_interval)
+            if cancelled: break
+
+            keep_alive_client = None
+            keep_alive_unit_id = None
+            with self._state_lock:
+                # Solo proceder si estamos conectados Y el cliente existe
+                if not self._state["connected"] or self._state["is_connecting"] or not self.client:
+                     self.log_service.log_info("Keep-alive: Conexión no lista, deteniendo worker.")
+                     break
+                keep_alive_client = self.client
+                keep_alive_unit_id = self._state["unit_id"]
+
+            if keep_alive_client and keep_alive_unit_id is not None:
+                self.log_service.log_debug("Keep-alive: Enviando lectura de prueba...")
+                current_time = time.time() # Marcar tiempo antes de enviar
+                try:
+                    values = keep_alive_client.read_holding_registers(keep_alive_unit_id, 0, 1)
+                    self.log_service.log_debug(f"Keep-alive: Lectura OK, valor={values}")
+                    self._update_status(last_keep_alive_ok=current_time)
+
+                except (ConnectionException, socket.error, socket.timeout) as e:
+                     error_msg = f"Keep-alive falló (conexión): {e}"
+                     self.log_service.log_error(error_msg + ". Iniciando desconexión...")
+                     # Resetear estado desde aquí (más seguro que llamar a disconnect recursivamente)
+                     self._reset_state_to_disconnected(message="Conexión perdida (Keep-Alive)", error=error_msg)
+                     break # Salir del worker
+
+                except ModbusException as e:
+                     warn_msg = f"Keep-alive: Error Modbus (conexión OK): {e}"
+                     self.log_service.log_warning(warn_msg)
+                     self._update_status(last_keep_alive_ok=current_time) # Considerar OK para TCP
+
+                except Exception as e:
+                     crit_msg = f"Keep-alive: Error inesperado: {e}"
+                     self.log_service.log_critical(crit_msg + ". Iniciando desconexión...")
+                     self._reset_state_to_disconnected(message="Error crítico (Keep-Alive)", error=crit_msg)
+                     break # Salir del worker
+            else:
+                 self.log_service.log_warning("Keep-alive: Estado inconsistente (no client/unit_id).")
+                 time.sleep(1) # Evitar loop rápido si hay error raro
+
+        self.log_service.log_info("Hilo Keep-alive terminado.")
+        self._keep_alive_thread = None
+
