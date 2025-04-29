@@ -1,4 +1,3 @@
-# services/connection_service.py
 import threading
 import time
 import socket

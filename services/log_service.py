@@ -1,4 +1,3 @@
-# services/log_service.py
 import time
 import traceback # Para formatear tracebacks
 from collections import deque

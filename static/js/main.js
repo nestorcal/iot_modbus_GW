@@ -1,6 +1,3 @@
-// static/js/main.js
-
-/** Lógica principal del frontend */
 document.addEventListener('DOMContentLoaded', () => {
 
     // --- Selección de Elementos DOM ---

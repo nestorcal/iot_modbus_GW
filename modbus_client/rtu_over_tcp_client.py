@@ -1,4 +1,3 @@
-# modbus_client/rtu_over_tcp_client.py
 import socket
 import struct
 import time

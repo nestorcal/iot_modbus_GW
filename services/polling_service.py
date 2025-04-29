@@ -1,4 +1,3 @@
-# services/polling_service.py
 import threading
 import time
 import socket # Para errores específicos

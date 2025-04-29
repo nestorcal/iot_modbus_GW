@@ -1,4 +1,3 @@
-# modbus_client/tcp_client.py
 import socket
 import struct
 import time
